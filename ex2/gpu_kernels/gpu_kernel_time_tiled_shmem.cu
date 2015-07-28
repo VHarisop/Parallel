@@ -12,54 +12,122 @@
 #include "gpu_util.h"
 #include "kernel.h"
 #include "timer.h"
+#include "alloc.h"
 
 #define GPU_KERNEL_NAME(name)   do_jacobi_gpu_time_tiled ## name
+
+// optimal: BX = 26, BY = 6, T_STEP = 3, TSZ = 3
+// optimal: BX = 64, BY = 8, T_STEP = TSZ = 4
+
+#define BLOCKSZ (24)
+#define BSZX (88)
+#define BSZY (6)
+#define TSZ  (4)
+#define TIME_STEP (4)
 
 __global__ void GPU_KERNEL_NAME(__time_tiled_shmem)(REAL *in, REAL *out, int N)
 {
     // FILLME: the time-tiled GPU kernel code
     int i = threadIdx.x;
     int j = threadIdx.y;
+    bool x_check, y_check, ind_check;
+    int q, t, ei, ej;
+    
+    // fast range checking
+    int BY = BSZY * TSZ + 2 * TIME_STEP;
+    int BX = BSZX + 2 * TIME_STEP;
 
-    // block size (symmetrical)
-    int BSZ = 32;
+    // BSZY * TSZ + 2 * T + 2 -> 2 additional places for "useless" elements
+    __shared__ float u[BSZY * TSZ + 2 * TIME_STEP][BSZX + 2 * TIME_STEP];
 
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
+    // array of index checks 
+    bool ys[TSZ];
+    bool is[TSZ];
+    bool yind[TSZ];
 
-    int I_0 = by * N * BSZ + bx * BSZ;
-    int Index = by * BSZ * N + bx * BSZ + (j + 1) * N + i + 1;
+    // local array of indices to update
+    float vals[TSZ];
 
-    int G_I = bx * BSZ + i + 1; // global I
-    int G_J = by * BSZ + j + 1; // global J
+    // Index -> top left corner of block array indices
+    int Index = (BSZY * TSZ) * blockIdx.y * N + blockIdx.x * BSZX + (j * TSZ) * N + i - (N + 1) * TIME_STEP;
 
-    __shared__ float u_prev_sh[34][34];
+    #pragma unroll
+    for (q = 0; q < TSZ; ++q)
+    {
+        ej = j * TSZ + q;
+        ei = Index + q * N;
+        // update y-index checks to use later
+        ys[q] = (ej > 0) && (ej < (BY - 1));
 
-    int ii = j * BSZ + i;   // thread indexing
-    int I = ii % (BSZ + 2); // x-direction index
-    int J = ii / (BSZ + 2); // y-direction index
+        yind[q] = (ej >= TIME_STEP) && (ej < (BY - TIME_STEP));
 
-    int I_G = I_0 + J * N + I;   // total index
+        // update general index checks to use later
+        is[q] = (ei > N) && (ei < (N * N - N - 1)) && ((ei % N) != 0) && ((ei % N) != (N - 1));
 
-    u_prev_sh[I][J] = in[I_G];
+        if ((ei >= 0) && (ei < (N * N)))
+        {
+            // update ej 
+            u[ej][i] = in[ei];
+        }
+    }
 
-    int ii2 = BSZ * BSZ + j * BSZ + i;
-    int I2 = ii2 % (BSZ + 2);
-    int J2 = ii2 / (BSZ + 2);
-
-    int I_G2 = I_0 + J2 * N + I2;
-
-    if ((I2 < (BSZ + 2)) && (J2 < (BSZ + 2)) && (ii2 < N * N))
-        u_prev_sh[I2][J2] = in[I_G2];
-
+    // wait for all elements to be loaded
     __syncthreads();
 
-    if ((G_J >= N - 1) || (G_I >= N - 1)) 
-        return;
+    x_check = (i > 0) && (i < (BX - 1));
 
-    out[Index] = 0.25f * (u_prev_sh[i+2][j+1] + u_prev_sh[i][j+1] + u_prev_sh[i+1][j+2] + u_prev_sh[i+1][j]);
+    if (x_check)
+    {
+        // update elements here
+        
+        for (t = 1; t < TIME_STEP; ++t)
+        {
+            // T - 1 steps of updates
 
+            #pragma unroll
+            for (q = 0; q < TSZ; ++q)
+            {
+                ej = j * TSZ + q;
+                // should we update this index;
+                if (ys[q] && is[q])
+                {
+                    vals[q] = 0.25f * (u[ej][i-1] + u[ej][i+1] + u[ej-1][i] + u[ej+1][i]);
+                }
+                
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (q = 0; q < TSZ; ++q)
+            {
+                ej = j * TSZ + q;
+                if (ys[q] && is[q])
+                {
+                    u[ej][i] = vals[q];
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    x_check = (i >= TIME_STEP) && (i < (BX - TIME_STEP));
+
+    if (x_check)
+    {
+        for (q = 0; q < TSZ; ++q)
+        {
+            ej = j * TSZ + q;
+            ei = Index + q * N;
+
+            if (yind[q] && is[q])
+            {
+                out[ei] = 0.25f * (u[ej][i-1] + u[ej][i+1] + u[ej-1][i] + u[ej+1][i]);
+            }
+        }
+    }
 }
+
+
 
 void MAKE_KERNEL_NAME(jacobi, _gpu, _time_tiled_shmem)(kernel_data_t *data)
 {
@@ -76,10 +144,12 @@ void MAKE_KERNEL_NAME(jacobi, _gpu, _time_tiled_shmem)(kernel_data_t *data)
     copy_data_from_cpu(dev_A_prev, A_prev, N);
     timer_stop(&transfer_timer);
 
-    // FILLME: set up grid and thread block dimensions
 
-    dim3 block(32, 32);
-    dim3 grid(int((N - 2 - 0.5)/block.x) + 1, int((N - 2 - 0.5)/block.y) + 1);
+    // blocks: BX = bx + 2 * T, BY = by + (2 * T / ThreadLoad) -> load balance
+    dim3 block(BSZX + 2 * TIME_STEP, BSZY + int((2 * TIME_STEP - 0.5) / TSZ) + 1);
+    dim3 grid(int((N - 0.5)/BSZX) + 1, int((N - 0.5)/(BSZY * TSZ)) + 1);
+    
+    printf("N: %d, Grid: %d\n", N, int((N - 0.5)/BLOCKSZ) + 1);
 
     timer_clear(&compute_timer);
     timer_start(&compute_timer);
